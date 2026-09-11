@@ -171,6 +171,19 @@ struct optee_ffa {
 	struct work_struct notif_work;
 };
 
+/**
+ * struct optee_rpmi - RPMI TEE service group specific data
+ * @tdev:	TEE endpoint of OP-TEE on the RPMI TEE framework
+ * @mutex:	serializes access to @global_ids
+ * @global_ids:	maps memory parcel handles to struct tee_shm
+ */
+struct optee_rpmi {
+	struct rpmi_tee_device *tdev;
+	/* Serializes access to @global_ids */
+	struct mutex mutex;
+	struct rhashtable global_ids;
+};
+
 struct optee;
 
 /**
@@ -259,6 +272,7 @@ struct optee {
 	union {
 		struct optee_smc smc;
 		struct optee_ffa ffa;
+		struct optee_rpmi rpmi;
 	};
 	struct optee_shm_arg_cache shm_arg_cache;
 	struct optee_call_queue call_queue;
@@ -422,9 +436,33 @@ static inline void reg_pair_from_64(u32 *reg0, u32 *reg1, u64 val)
 }
 
 /* Registration of the ABIs */
+#ifdef CONFIG_HAVE_ARM_SMCCC
 int optee_smc_abi_register(void);
 void optee_smc_abi_unregister(void);
+#else
+static inline int optee_smc_abi_register(void)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void optee_smc_abi_unregister(void)
+{
+}
+#endif
 int optee_ffa_abi_register(void);
 void optee_ffa_abi_unregister(void);
+#if IS_ENABLED(CONFIG_OPTEE_RPMI_ABI)
+int optee_rpmi_abi_register(void);
+void optee_rpmi_abi_unregister(void);
+#else
+static inline int optee_rpmi_abi_register(void)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void optee_rpmi_abi_unregister(void)
+{
+}
+#endif
 
 #endif /*OPTEE_PRIVATE_H*/
