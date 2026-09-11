@@ -23583,6 +23583,14 @@ F:	drivers/mailbox/riscv-sbi-mpxy-mbox.c
 F:	include/linux/mailbox/riscv-rpmi-message.h
 F:	include/linux/mailbox/riscv-sbi-mpxy-mbox.h
 
+RISC-V RPMI TEE FRAMEWORK DRIVER
+M:	Marouene Boubakri <marouene.boubakri@oss.nxp.com>
+L:	linux-riscv@lists.infradead.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/firmware/riscv,rpmi-mpxy-tee.yaml
+F:	drivers/firmware/riscv_rpmi_tee.c
+F:	include/linux/riscv_rpmi_tee.h
+
 RISC-V SPACEMIT SoC Support
 M:	Yixun Lan <dlan@kernel.org>
 L:	linux-riscv@lists.infradead.org

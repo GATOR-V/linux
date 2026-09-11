@@ -34,6 +34,7 @@ obj-$(CONFIG_GOOGLE_FIRMWARE)	+= google/
 obj-y				+= efi/
 obj-y				+= imx/
 obj-y				+= psci/
+obj-$(CONFIG_RISCV_RPMI_TEE)	+= riscv_rpmi_tee.o
 obj-y				+= qcom/
 obj-y				+= samsung/
 obj-y				+= smccc/

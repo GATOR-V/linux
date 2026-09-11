@@ -305,6 +305,21 @@ source "drivers/firmware/imx/Kconfig"
 source "drivers/firmware/meson/Kconfig"
 source "drivers/firmware/microchip/Kconfig"
 source "drivers/firmware/psci/Kconfig"
+
+config RISCV_RPMI_TEE
+	tristate "RISC-V RPMI TEE service group framework"
+	depends on RISCV_SBI_MPXY_MBOX
+	depends on OF
+	help
+	  This driver implements the Rich Execution Environment side of the
+	  TEE service group of the RISC-V Platform Management Interface
+	  (RPMI) on top of the SBI Message Proxy (MPXY) mailbox. It gives
+	  Trusted Execution Environment drivers a bus of TEE endpoints,
+	  synchronous TEE_CALL requests and memory sharing through memory
+	  parcels.
+
+	  This driver is required by the OP-TEE driver on RISC-V.
+
 source "drivers/firmware/qcom/Kconfig"
 source "drivers/firmware/samsung/Kconfig"
 source "drivers/firmware/smccc/Kconfig"
