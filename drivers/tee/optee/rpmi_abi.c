@@ -352,6 +352,15 @@ static int optee_rpmi_shm_unregister(struct tee_context *ctx,
 	struct optee_rpmi_msg rsp;
 	int rc;
 
+	/*
+	 * A shm whose parcel was already released and reclaimed (e.g. an RPC
+	 * buffer dropped by handle_rpmi_rpc_func_cmd_shm_free()) reaches here
+	 * with a cleared handle. There is nothing to unregister or reclaim;
+	 * a real parcel never has handle 0 (parcel id starts at 1).
+	 */
+	if (!handle)
+		return 0;
+
 	optee_shm_rem_rpmi_handle(optee, handle);
 	shm->sec_world_id = 0;
 
@@ -380,6 +389,10 @@ static int optee_rpmi_shm_unregister_supp(struct tee_context *ctx,
 	 * We're skipping the OPTEE_RPMI_UNREGISTER_SHM call since this
 	 * memory is not mapped in OP-TEE.
 	 */
+
+	/* Already released and reclaimed (see optee_rpmi_shm_unregister()). */
+	if (!handle)
+		return 0;
 
 	optee_shm_rem_rpmi_handle(optee, handle);
 	shm->sec_world_id = 0;
@@ -480,6 +493,46 @@ static void handle_rpmi_rpc_func_cmd_shm_alloc(struct tee_context *ctx,
 		return;
 	}
 
+	/*
+	 * Buffers allocated for an RPC do not come from the registered
+	 * shared memory pool, so they are not memory parcels yet. Share
+	 * them so that OP-TEE gets a valid parcel handle as global ID.
+	 */
+	if (!shm->sec_world_id) {
+		struct sg_table sgt;
+		struct page **pages;
+		size_t num_pages;
+		u64 handle;
+		int rc;
+
+		pages = tee_shm_get_pages(shm, &num_pages);
+		if (IS_ERR(pages) || !num_pages) {
+			arg->ret = TEEC_ERROR_OUT_OF_MEMORY;
+			goto err_free;
+		}
+		rc = sg_alloc_table_from_pages(&sgt, pages, num_pages, 0,
+					       num_pages * PAGE_SIZE,
+					       GFP_KERNEL);
+		if (rc) {
+			arg->ret = TEEC_ERROR_OUT_OF_MEMORY;
+			goto err_free;
+		}
+		rc = rpmi_tee_mem_share(optee->rpmi.tdev, sgt.sgl,
+					RPMI_TEE_MEM_ACCESS_RW, &handle);
+		sg_free_table(&sgt);
+		if (rc) {
+			arg->ret = TEEC_ERROR_OUT_OF_MEMORY;
+			goto err_free;
+		}
+		rc = optee_shm_add_rpmi_handle(optee, shm, handle);
+		if (rc) {
+			rpmi_tee_mem_reclaim(optee->rpmi.tdev, handle);
+			arg->ret = TEEC_ERROR_OUT_OF_MEMORY;
+			goto err_free;
+		}
+		shm->sec_world_id = handle;
+	}
+
 	arg->params[0] = (struct optee_msg_param){
 		.attr = OPTEE_MSG_ATTR_TYPE_FMEM_OUTPUT,
 		.u.fmem.size = tee_shm_get_size(shm),
@@ -488,6 +541,10 @@ static void handle_rpmi_rpc_func_cmd_shm_alloc(struct tee_context *ctx,
 	};
 
 	arg->ret = TEEC_SUCCESS;
+	return;
+
+err_free:
+	tee_shm_free(shm);
 }
 
 static void handle_rpmi_rpc_func_cmd_shm_free(struct tee_context *ctx,
@@ -505,14 +562,25 @@ static void handle_rpmi_rpc_func_cmd_shm_free(struct tee_context *ctx,
 		goto err_bad_param;
 	switch (arg->params[0].u.value.a) {
 	case OPTEE_RPC_SHM_TYPE_APPL:
-		optee_rpc_cmd_free_suppl(ctx, shm);
-		break;
 	case OPTEE_RPC_SHM_TYPE_KERNEL:
-		tee_shm_free(shm);
 		break;
 	default:
 		goto err_bad_param;
 	}
+
+	/* Drop the parcel shared in handle_rpmi_rpc_func_cmd_shm_alloc() */
+	if (shm->sec_world_id) {
+		u64 handle = shm->sec_world_id;
+
+		optee_shm_rem_rpmi_handle(optee, handle);
+		shm->sec_world_id = 0;
+		rpmi_tee_mem_reclaim(optee->rpmi.tdev, handle);
+	}
+
+	if (arg->params[0].u.value.a == OPTEE_RPC_SHM_TYPE_APPL)
+		optee_rpc_cmd_free_suppl(ctx, shm);
+	else
+		tee_shm_free(shm);
 	arg->ret = TEEC_SUCCESS;
 	return;
 
