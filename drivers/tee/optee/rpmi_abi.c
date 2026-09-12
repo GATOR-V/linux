@@ -6,6 +6,8 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/errno.h>
+#include <linux/genalloc.h>
+#include <linux/mm.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/riscv_rpmi_tee.h>
@@ -13,6 +15,7 @@
 #include <linux/rpmb.h>
 #include <linux/scatterlist.h>
 #include <linux/sched.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/tee_core.h>
@@ -405,29 +408,118 @@ static int optee_rpmi_shm_unregister_supp(struct tee_context *ctx,
 }
 
 /*
- * 4. Dynamic shared memory pool based on alloc_pages()
+ * 4. Dynamic shared memory pool
  *
- * Shared memory can be allocated from a fixed pool of memory or it can
- * be allocated from a pool of pages, this pool of pages is used for
- * the OP-TEE RPMI ABI.
+ * Buffers are shared with OP-TEE as memory parcels. A parcel create
+ * message can only describe a bounded number of discontiguous page runs,
+ * and loading a large TA (hundreds of KiB) otherwise needs a high-order
+ * contiguous allocation that is unreliable once memory is fragmented -
+ * alloc_pages_exact() then returns -ENOMEM and the TA load fails with
+ * TEEC_ERROR_OUT_OF_MEMORY. To make large allocations dependable, reserve
+ * a few physically contiguous chunks early at probe and carve large
+ * buffers out of them with a gen_pool: each such buffer is contiguous,
+ * i.e. a single parcel block. Small buffers keep using the page allocator
+ * so they neither exhaust nor fragment the reserved chunks.
  */
+
+#define RPMI_SHM_POOL_CHUNK_SIZE	SZ_2M
+#define RPMI_SHM_POOL_NR_CHUNKS		8
+#define RPMI_SHM_POOL_MIN_ALLOC		SZ_128K
+
+struct rpmi_shm_pool {
+	struct tee_shm_pool pool;
+	struct gen_pool *genpool;
+	void *chunks[RPMI_SHM_POOL_NR_CHUNKS];
+	unsigned int nr_chunks;
+};
+
+static struct rpmi_shm_pool *to_rpmi_shm_pool(struct tee_shm_pool *pool)
+{
+	return container_of(pool, struct rpmi_shm_pool, pool);
+}
 
 static int pool_rpmi_op_alloc(struct tee_shm_pool *pool,
 			      struct tee_shm *shm, size_t size, size_t align)
 {
-	return tee_dyn_shm_alloc_helper(shm, size, align,
-					optee_rpmi_shm_register);
+	struct rpmi_shm_pool *rp = to_rpmi_shm_pool(pool);
+	size_t nr_pages = roundup(size, PAGE_SIZE) / PAGE_SIZE;
+	struct page **pages;
+	unsigned long va;
+	unsigned int i;
+	int rc;
+
+	/*
+	 * Only large buffers are worth serving from the reserved contiguous
+	 * chunks; small ones use the page allocator so they don't fragment
+	 * the reserve. Buffers larger than a chunk cannot be served either.
+	 */
+	if (!rp->genpool || size < RPMI_SHM_POOL_MIN_ALLOC ||
+	    nr_pages * PAGE_SIZE > RPMI_SHM_POOL_CHUNK_SIZE)
+		return tee_dyn_shm_alloc_helper(shm, size, align,
+						optee_rpmi_shm_register);
+
+	va = gen_pool_alloc(rp->genpool, nr_pages * PAGE_SIZE);
+	if (!va)
+		return tee_dyn_shm_alloc_helper(shm, size, align,
+						optee_rpmi_shm_register);
+
+	pages = kcalloc(nr_pages, sizeof(*pages), GFP_KERNEL);
+	if (!pages) {
+		gen_pool_free(rp->genpool, va, nr_pages * PAGE_SIZE);
+		return -ENOMEM;
+	}
+	for (i = 0; i < nr_pages; i++)
+		pages[i] = virt_to_page((void *)(va + i * PAGE_SIZE));
+
+	shm->kaddr = (void *)va;
+	shm->paddr = virt_to_phys(shm->kaddr);
+	shm->size = nr_pages * PAGE_SIZE;
+	shm->pages = pages;
+	shm->num_pages = nr_pages;
+
+	rc = optee_rpmi_shm_register(shm->ctx, shm, pages, nr_pages, va);
+	if (rc) {
+		shm->kaddr = NULL;
+		shm->pages = NULL;
+		shm->num_pages = 0;
+		kfree(pages);
+		gen_pool_free(rp->genpool, va, nr_pages * PAGE_SIZE);
+		return rc;
+	}
+
+	return 0;
 }
 
 static void pool_rpmi_op_free(struct tee_shm_pool *pool,
 			      struct tee_shm *shm)
 {
+	struct rpmi_shm_pool *rp = to_rpmi_shm_pool(pool);
+
+	if (rp->genpool && shm->kaddr &&
+	    gen_pool_has_addr(rp->genpool, (unsigned long)shm->kaddr,
+			      shm->size)) {
+		optee_rpmi_shm_unregister(shm->ctx, shm);
+		gen_pool_free(rp->genpool, (unsigned long)shm->kaddr, shm->size);
+		kfree(shm->pages);
+		shm->pages = NULL;
+		shm->num_pages = 0;
+		shm->kaddr = NULL;
+		return;
+	}
+
 	tee_dyn_shm_free_helper(shm, optee_rpmi_shm_unregister);
 }
 
 static void pool_rpmi_op_destroy_pool(struct tee_shm_pool *pool)
 {
-	kfree(pool);
+	struct rpmi_shm_pool *rp = to_rpmi_shm_pool(pool);
+	unsigned int i;
+
+	if (rp->genpool)
+		gen_pool_destroy(rp->genpool);
+	for (i = 0; i < rp->nr_chunks; i++)
+		free_pages_exact(rp->chunks[i], RPMI_SHM_POOL_CHUNK_SIZE);
+	kfree(rp);
 }
 
 static const struct tee_shm_pool_ops pool_rpmi_ops = {
@@ -437,21 +529,50 @@ static const struct tee_shm_pool_ops pool_rpmi_ops = {
 };
 
 /**
- * optee_rpmi_shm_pool_alloc_pages() - create page-based allocator pool
+ * optee_rpmi_shm_pool_alloc_pages() - create the RPMI shared memory pool
  *
- * This pool is used with OP-TEE over RPMI. In this case command buffers
- * and such are allocated from kernel's own memory.
+ * Command buffers and such are allocated from the kernel's own memory.
+ * A best-effort reserve of contiguous chunks is set up for large buffers;
+ * if it cannot be established the pool still works via the page-allocator
+ * fallback, only less reliably for large TA images.
  */
 static struct tee_shm_pool *optee_rpmi_shm_pool_alloc_pages(void)
 {
-	struct tee_shm_pool *pool = kzalloc_obj(*pool);
+	struct rpmi_shm_pool *rp = kzalloc_obj(*rp);
+	unsigned int i;
 
-	if (!pool)
+	if (!rp)
 		return ERR_PTR(-ENOMEM);
 
-	pool->ops = &pool_rpmi_ops;
+	rp->pool.ops = &pool_rpmi_ops;
 
-	return pool;
+	rp->genpool = gen_pool_create(PAGE_SHIFT, -1);
+	if (rp->genpool) {
+		for (i = 0; i < RPMI_SHM_POOL_NR_CHUNKS; i++) {
+			void *chunk = alloc_pages_exact(RPMI_SHM_POOL_CHUNK_SIZE,
+							GFP_KERNEL | __GFP_ZERO);
+
+			if (!chunk)
+				break;
+			if (gen_pool_add(rp->genpool, (unsigned long)chunk,
+					 RPMI_SHM_POOL_CHUNK_SIZE, -1)) {
+				free_pages_exact(chunk,
+						 RPMI_SHM_POOL_CHUNK_SIZE);
+				break;
+			}
+			rp->chunks[rp->nr_chunks++] = chunk;
+		}
+		if (!rp->nr_chunks) {
+			gen_pool_destroy(rp->genpool);
+			rp->genpool = NULL;
+		} else {
+			pr_info("reserved %u x %lu KiB contiguous for large buffers\n",
+				rp->nr_chunks,
+				(unsigned long)RPMI_SHM_POOL_CHUNK_SIZE / SZ_1K);
+		}
+	}
+
+	return &rp->pool;
 }
 
 /*
